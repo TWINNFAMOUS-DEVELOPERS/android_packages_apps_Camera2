@@ -43,9 +43,10 @@ import android.view.OrientationEventListener;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-
+import com.android.camera.PhotoModule;
 import com.android.camera.CameraManager.CameraProxy;
 import com.android.camera.app.OrientationManager;
+import com.android.camera.data.LocalData;
 import com.android.camera.exif.ExifInterface;
 import com.android.camera.util.CameraUtil;
 import com.android.camera.util.UsageStatistics;
@@ -129,6 +130,7 @@ public class WideAnglePanoramaModule
     private int mDeviceOrientation;
     private int mDeviceOrientationAtCapture;
     private int mCameraOrientation;
+    private int mPanoAngle;
     private int mOrientationCompensation;
 
     private SoundClips.Player mSoundPlayer;
@@ -328,6 +330,13 @@ public class WideAnglePanoramaModule
             return false;
         }
         Parameters parameters = mCameraDevice.getParameters();
+        String sceneMode = parameters.getSceneMode();
+        if ((null != sceneMode) && (!sceneMode.equals(Parameters.SCENE_MODE_AUTO))){
+            if (CameraUtil.isSupported(Parameters.SCENE_MODE_AUTO,
+                                           parameters.getSupportedSceneModes())){
+                parameters.setSceneMode(Parameters.SCENE_MODE_AUTO);
+            }
+        }
         setupCaptureParams(parameters);
         configureCamera(parameters);
         return true;
@@ -481,9 +490,24 @@ public class WideAnglePanoramaModule
     @Override
     public void onPreviewUILayoutChange(int l, int t, int r, int b) {
         Log.d(TAG, "layout change: " + (r - l) + "/" + (b - t));
+        boolean capturePending = false;
+        if (mCaptureState == CAPTURE_STATE_MOSAIC){
+            capturePending = true;
+        }
         mPreviewUIWidth = r - l;
         mPreviewUIHeight = b - t;
         configMosaicPreview();
+        if (capturePending == true){
+            mMainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!mPaused){
+                        mMainHandler.removeMessages(MSG_RESET_TO_PREVIEW);
+                        startCapture();
+                    }
+                }
+            });
+        }
     }
 
     @Override
@@ -640,9 +664,9 @@ public class WideAnglePanoramaModule
         if (mUsingFrontCamera) {
             // mCameraOrientation is negative with respect to the front facing camera.
             // See document of android.hardware.Camera.Parameters.setRotation.
-            orientation = (mDeviceOrientationAtCapture - mCameraOrientation + 360) % 360;
+            orientation = (mDeviceOrientationAtCapture - mCameraOrientation - mPanoAngle + 360) % 360;
         } else {
-            orientation = (mDeviceOrientationAtCapture + mCameraOrientation) % 360;
+            orientation = (mDeviceOrientationAtCapture + mCameraOrientation - mPanoAngle) % 360;
         }
         return orientation;
     }
@@ -722,12 +746,12 @@ public class WideAnglePanoramaModule
     }
 
     private void resetToPreviewIfPossible() {
+        reset();
         if (!mMosaicFrameProcessorInitialized
                 || mUI.getSurfaceTexture() == null
                 || !mMosaicPreviewConfigured) {
             return;
         }
-        reset();
         if (!mPaused) {
             startCameraPreview();
         }
@@ -741,7 +765,12 @@ public class WideAnglePanoramaModule
         if (jpegData != null) {
             String filename = PanoUtil.createName(
                     mActivity.getResources().getString(R.string.pano_file_name_format), mTimeTaken);
-            String filepath = Storage.generateFilepath(filename);
+            String filepath = Storage.generateFilepath(filename,
+                              PhotoModule.PIXEL_FORMAT_JPEG);
+
+            UsageStatistics.onEvent(UsageStatistics.COMPONENT_PANORAMA,
+                    UsageStatistics.ACTION_CAPTURE_DONE, null, 0,
+                    UsageStatistics.hashFileName(filename + ".jpg"));
 
             Location loc = mLocationManager.getCurrentLocation();
             ExifInterface exif = new ExifInterface();
@@ -759,8 +788,8 @@ public class WideAnglePanoramaModule
                 Storage.writeFile(filepath, jpegData);
             }
             int jpegLength = (int) (new File(filepath).length());
-            return Storage.addImage(mContentResolver, filename, mTimeTaken,
-                    loc, orientation, jpegLength, filepath, width, height);
+            return Storage.addImage(mContentResolver, filename, mTimeTaken, loc, orientation,
+                    jpegLength, filepath, width, height, LocalData.MIME_TYPE_JPEG);
         }
         return null;
     }
@@ -812,7 +841,7 @@ public class WideAnglePanoramaModule
             stopCapture(true);
             reset();
         }
-
+        mUI.showPreviewCover();
         releaseCamera();
         synchronized (mRendererLock) {
             mCameraTexture = null;
@@ -846,6 +875,10 @@ public class WideAnglePanoramaModule
 
     @Override
     public void onOrientationChanged(int orientation) {
+    }
+
+    @Override
+    public void resizeForPreviewAspectRatio() {
     }
 
     @Override
@@ -883,7 +916,12 @@ public class WideAnglePanoramaModule
             mPreviewUIWidth = size.x;
             mPreviewUIHeight = size.y;
             configMosaicPreview();
-            mActivity.updateStorageSpaceAndHint();
+            mMainHandler.post(new Runnable(){
+                @Override
+                public void run(){
+                    mActivity.updateStorageSpaceAndHint();
+                }
+            });
         }
         keepScreenOnAwhile();
 
@@ -971,8 +1009,13 @@ public class WideAnglePanoramaModule
             // Set the display orientation to 0, so that the underlying mosaic
             // library can always get undistorted mCameraPreviewWidth x mCameraPreviewHeight
             // image data from SurfaceTexture.
-            mCameraDevice.setDisplayOrientation(0);
+            // as Panoroma will add 90 degree rotation compensation during
+            // postprocessing, we need to consider both camera mount angle and
+            // this compensation angle
+            mPanoAngle = (mCameraOrientation - 90 + 360) % 360;
+            mCameraDevice.setDisplayOrientation(mPanoAngle);
 
+            if (mCameraTexture != null)
             mCameraTexture.setOnFrameAvailableListener(this);
             mCameraDevice.setPreviewTexture(mCameraTexture);
         }
